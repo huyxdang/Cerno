@@ -13,7 +13,7 @@ from google.genai import types
 logger = logging.getLogger(__name__)
 
 SYSTEM_INSTRUCTION = (
-    "You are Genie-QA, a visual testing agent. You are looking at a browser window. "
+    "You are Cerno, a visual testing agent. You are looking at a browser window. "
     "Describe what you see in detail: the layout, text content, buttons, forms, colors, "
     "and any visual or accessibility issues you notice. Be concise but thorough."
 )
@@ -33,8 +33,9 @@ async def run_live_session(
 ):
     """Run a Live API session. Sends frames + user questions, prints responses.
 
-    Uses AUDIO response modality with transcription to get text back,
-    since the native audio model requires audio output.
+    Uses AUDIO response modality with transcription since the native audio
+    model requires it. Frames are sent via send_client_content with inline_data
+    (send_realtime_input does not reliably deliver image data to the model).
 
     Automatically reconnects when the session TTL expires or on errors.
     """
@@ -63,15 +64,32 @@ async def run_live_session(
                             return
 
                         frame = await frame_queue.get()
-                        blob = types.Blob(data=frame, mime_type="image/jpeg")
-                        await session.send_realtime_input(media=blob)
+                        msg = types.Content(parts=[
+                            types.Part(
+                                inline_data=types.Blob(
+                                    data=frame, mime_type="image/jpeg"
+                                )
+                            ),
+                        ])
+                        await session.send_client_content(
+                            turns=msg, turn_complete=False
+                        )
 
                 async def send_text():
                     while True:
                         text = await text_queue.get()
-                        msg = types.Content(
-                            parts=[types.Part(text=text)]
-                        )
+                        # Include latest frame with the question
+                        parts = [types.Part(text=text)]
+                        try:
+                            frame = frame_queue.get_nowait()
+                            parts.insert(0, types.Part(
+                                inline_data=types.Blob(
+                                    data=frame, mime_type="image/jpeg"
+                                )
+                            ))
+                        except asyncio.QueueEmpty:
+                            pass
+                        msg = types.Content(parts=parts)
                         await session.send_client_content(
                             turns=msg, turn_complete=True
                         )
