@@ -21,108 +21,108 @@ SYSTEM_INSTRUCTION = (
 # Proactively reconnect before the 2-minute hard limit
 SESSION_TTL_SECONDS = 110
 
+LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+FALLBACK_MODEL = "gemini-2.5-flash"
 
-class GeminiSession:
-    """Manages a Gemini Live API connection with auto-reconnect and fallback."""
 
-    def __init__(self, api_key: str, model: str = "gemini-live-2.5-flash-preview"):
-        self._client = genai.Client(api_key=api_key)
-        self._model = model
-        self._session = None
-        self._session_start: float = 0
-        self._lock = asyncio.Lock()
-        self._connected = False
+async def run_live_session(
+    api_key: str,
+    frame_queue: asyncio.Queue,
+    text_queue: asyncio.Queue,
+    model: str = LIVE_MODEL,
+):
+    """Run a Live API session. Sends frames + user questions, prints responses.
 
-    async def connect(self) -> None:
-        """Open a Live API session."""
-        config = types.LiveConnectConfig(
-            response_modalities=["TEXT"],
-            system_instruction=types.Content(
-                parts=[types.Part(text=SYSTEM_INSTRUCTION)]
-            ),
-        )
-        self._session = await self._client.aio.live.connect(
-            model=self._model, config=config
-        ).__aenter__()
-        self._session_start = time.monotonic()
-        self._connected = True
-        logger.info("Live API session connected (model=%s)", self._model)
+    Uses AUDIO response modality with transcription to get text back,
+    since the native audio model requires audio output.
 
-    async def disconnect(self) -> None:
-        """Close the current session."""
-        if self._session:
-            try:
-                await self._session.__aexit__(None, None, None)
-            except Exception:
-                pass
-            self._session = None
-            self._connected = False
-            logger.info("Live API session disconnected")
+    Automatically reconnects when the session TTL expires or on errors.
+    """
+    client = genai.Client(api_key=api_key)
+    config = types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        output_audio_transcription={},
+        system_instruction=types.Content(
+            parts=[types.Part(text=SYSTEM_INSTRUCTION)]
+        ),
+    )
 
-    async def reconnect(self) -> None:
-        """Close and reopen the session (handles 2-min limit)."""
-        logger.info("Reconnecting Live API session...")
-        await self.disconnect()
-        await self.connect()
+    while True:
+        try:
+            session_start = time.monotonic()
+            logger.info("Opening Live API session (model=%s)...", model)
 
-    def _session_expired(self) -> bool:
-        return (time.monotonic() - self._session_start) >= SESSION_TTL_SECONDS
+            async with client.aio.live.connect(model=model, config=config) as session:
+                logger.info("Live API session connected")
 
-    async def send_frame(self, frame_bytes: bytes) -> None:
-        """Send a JPEG frame to the Live API session.
+                async def send_frames():
+                    while True:
+                        elapsed = time.monotonic() - session_start
+                        if elapsed >= SESSION_TTL_SECONDS:
+                            logger.info("Session TTL reached (%.0fs), reconnecting...", elapsed)
+                            return
 
-        Auto-reconnects if the session TTL has expired.
-        """
-        async with self._lock:
-            if not self._connected or self._session_expired():
-                await self.reconnect()
+                        frame = await frame_queue.get()
+                        blob = types.Blob(data=frame, mime_type="image/jpeg")
+                        await session.send_realtime_input(media=blob)
 
-            blob = types.Blob(data=frame_bytes, mime_type="image/jpeg")
-            try:
-                await self._session.send_realtime_input(media=blob)
-            except Exception as e:
-                logger.warning("send_frame failed (%s), reconnecting...", e)
-                await self.reconnect()
-                await self._session.send_realtime_input(media=blob)
+                async def send_text():
+                    while True:
+                        text = await text_queue.get()
+                        msg = types.Content(
+                            parts=[types.Part(text=text)]
+                        )
+                        await session.send_client_content(
+                            turns=msg, turn_complete=True
+                        )
 
-    async def receive_responses(self):
-        """Async generator that yields text responses from the Live API session."""
-        while self._connected and self._session:
-            try:
-                async for response in self._session.receive():
-                    if response.text is not None:
-                        yield response.text
-            except Exception as e:
-                if not self._connected:
-                    return
-                logger.warning("receive error (%s), will reconnect on next send", e)
-                return
+                async def receive_responses():
+                    async for response in session.receive():
+                        if response.server_content:
+                            sc = response.server_content
+                            if sc.output_transcription and sc.output_transcription.text:
+                                print(sc.output_transcription.text, end="", flush=True)
 
-    async def generate_content_fallback(self, frame_bytes: bytes) -> Optional[str]:
-        """Fallback: single-frame generateContent call (no Live API)."""
-        # For fallback, use the non-live model variant
-        fallback_model = self._model
-        for live_suffix in ("-live-001", "-live-preview"):
-            if live_suffix in fallback_model:
-                fallback_model = fallback_model.replace(live_suffix, "")
-        if "live" in fallback_model:
-            fallback_model = "gemini-2.5-flash"
-
-        response = await self._client.aio.models.generate_content(
-            model=fallback_model,
-            contents=[
-                types.Content(
-                    parts=[
-                        types.Part(text="Describe what you see in this screenshot in detail."),
-                        types.Part(
-                            inline_data=types.Blob(
-                                data=frame_bytes, mime_type="image/jpeg"
-                            )
-                        ),
-                    ]
+                done, pending = await asyncio.wait(
+                    [asyncio.ensure_future(send_frames()),
+                     asyncio.ensure_future(send_text()),
+                     asyncio.ensure_future(receive_responses())],
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-            ],
-        )
-        if response.text:
-            return response.text
-        return None
+                for task in pending:
+                    task.cancel()
+                for task in done:
+                    if task.exception():
+                        raise task.exception()
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Live session error (%s), reconnecting in 1s...", e)
+            await asyncio.sleep(1)
+
+
+async def run_fallback_once(
+    client: genai.Client,
+    frame_bytes: bytes,
+    model: str = FALLBACK_MODEL,
+) -> Optional[str]:
+    """Single-frame generateContent call (no Live API)."""
+    response = await client.aio.models.generate_content(
+        model=model,
+        contents=[
+            types.Content(
+                parts=[
+                    types.Part(text="Describe what you see in this screenshot in detail."),
+                    types.Part(
+                        inline_data=types.Blob(
+                            data=frame_bytes, mime_type="image/jpeg"
+                        )
+                    ),
+                ]
+            )
+        ],
+    )
+    if response.text:
+        return response.text
+    return None

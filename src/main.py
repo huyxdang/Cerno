@@ -5,15 +5,28 @@ Captures screen frames and streams them to Gemini for visual description.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env before any other imports (genai reads env vars at import time)
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 import argparse
 import asyncio
 import logging
-import os
 import sys
 from typing import Optional
 
+from google import genai
+
 from capture import capture_screen
-from live_session import GeminiSession
+from live_session import (
+    run_live_session,
+    run_fallback_once,
+    LIVE_MODEL,
+    FALLBACK_MODEL,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,7 +39,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Cerno — Vision Pipeline")
     p.add_argument("--fps", type=float, default=1.0, help="Frames per second (default: 1)")
     p.add_argument("--no-live", action="store_true", help="Use generateContent fallback instead of Live API")
-    p.add_argument("--model", default="gemini-live-2.5-flash-preview", help="Gemini model to use")
+    p.add_argument("--model", default=None, help="Gemini model to use")
     p.add_argument(
         "--region",
         type=str,
@@ -46,16 +59,17 @@ def parse_region(region_str: Optional[str]) -> Optional[dict]:
     return {"top": parts[0], "left": parts[1], "width": parts[2], "height": parts[3]}
 
 
-async def run_fallback(session: GeminiSession, fps: float, region: Optional[dict]):
+async def run_fallback(api_key: str, fps: float, region: Optional[dict], model: str):
     """Polling loop using generateContent (no Live API)."""
     interval = 1.0 / fps
-    logger.info("Running in fallback mode (generateContent) at %.1f FPS", fps)
+    client = genai.Client(api_key=api_key)
+    logger.info("Running in fallback mode (generateContent) at %.1f FPS, model=%s", fps, model)
 
     while True:
         frame = capture_screen(region)
         logger.info("Captured frame (%d bytes), sending...", len(frame))
         try:
-            description = await session.generate_content_fallback(frame)
+            description = await run_fallback_once(client, frame, model=model)
             if description:
                 print(f"\n--- Description ---\n{description}\n")
         except Exception as e:
@@ -63,44 +77,53 @@ async def run_fallback(session: GeminiSession, fps: float, region: Optional[dict
         await asyncio.sleep(interval)
 
 
-async def run_live(session: GeminiSession, fps: float, region: Optional[dict]):
-    """Live API loop using asyncio.TaskGroup for concurrent send/receive."""
+async def read_stdin(text_queue: asyncio.Queue):
+    """Read lines from stdin in a thread and put them on the text queue."""
+    loop = asyncio.get_event_loop()
+    while True:
+        line = await loop.run_in_executor(None, sys.stdin.readline)
+        if not line:
+            break
+        line = line.strip()
+        if line:
+            await text_queue.put(line)
+
+
+async def run_live(api_key: str, fps: float, region: Optional[dict], model: str):
+    """Live API loop with concurrent frame capture, user input, and response streaming."""
     interval = 1.0 / fps
     logger.info("Running in Live API mode at %.1f FPS", fps)
+    print("Session active. Type a question and press Enter to ask about what's on screen.")
+    print("Press Ctrl+C to exit.\n")
 
-    await session.connect()
+    frame_queue = asyncio.Queue(maxsize=2)
+    text_queue = asyncio.Queue()
 
-    stop_event = asyncio.Event()
-
-    async def send_frames():
-        while not stop_event.is_set():
+    async def capture_loop():
+        while True:
             frame = capture_screen(region)
-            try:
-                await session.send_frame(frame)
-            except Exception as e:
-                logger.error("Failed to send frame: %s", e)
-                # Session will auto-reconnect on next send
+            if frame_queue.full():
+                try:
+                    frame_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            await frame_queue.put(frame)
             await asyncio.sleep(interval)
 
-    async def receive_responses():
-        while not stop_event.is_set():
-            try:
-                async for text in session.receive_responses():
-                    print(text, end="", flush=True)
-                # Generator ended (disconnect/error) — pause before retry
-                # Session reconnect happens in send_frame
-                await asyncio.sleep(1)
-            except Exception as e:
-                logger.warning("Receive loop error: %s", e)
-                await asyncio.sleep(1)
+    capture_task = asyncio.ensure_future(capture_loop())
+    input_task = asyncio.ensure_future(read_stdin(text_queue))
+    session_task = asyncio.ensure_future(
+        run_live_session(api_key, frame_queue, text_queue, model=model)
+    )
 
     try:
-        await asyncio.gather(send_frames(), receive_responses())
+        await asyncio.gather(capture_task, input_task, session_task)
     except asyncio.CancelledError:
         pass
     finally:
-        stop_event.set()
-        await session.disconnect()
+        capture_task.cancel()
+        input_task.cancel()
+        session_task.cancel()
 
 
 async def main():
@@ -113,16 +136,17 @@ async def main():
         sys.exit(1)
 
     region = parse_region(args.region)
-    session = GeminiSession(api_key=api_key, model=args.model)
 
     if args.no_live:
-        await run_fallback(session, args.fps, region)
+        model = args.model or FALLBACK_MODEL
+        await run_fallback(api_key, args.fps, region, model)
     else:
+        model = args.model or LIVE_MODEL
         try:
-            await run_live(session, args.fps, region)
+            await run_live(api_key, args.fps, region, model)
         except Exception as e:
             logger.warning("Live API failed (%s), falling back to generateContent", e)
-            await run_fallback(session, args.fps, region)
+            await run_fallback(api_key, args.fps, region, args.model or FALLBACK_MODEL)
 
 
 if __name__ == "__main__":
